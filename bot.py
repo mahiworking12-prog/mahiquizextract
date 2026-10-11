@@ -1,11 +1,15 @@
 import os
-import asyncio
+import io
 import logging
-from telethon import TelegramClient
-from telethon.tl.types import MessageMediaPoll
-from telethon.sessions import StringSession
 from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    PollAnswerHandler,
+    MessageHandler,
+    filters,
+    ContextTypes
+)
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -13,210 +17,149 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Environment variables (Railway me set honge)
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8618880598:AAEghYmMFTmJM3tkDSVUTr1z_8vHps4WJQQ")
-API_ID = int(os.getenv("API_ID", "0"))
-API_HASH = os.getenv("API_HASH", "")
-STRING_SESSION = os.getenv("STRING_SESSION", "")
 
 OPTION_LETTERS = ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J"]
 
+# In-memory storage: chat_id -> list of questions
+# Ek question ka structure:
+# {
+#   "poll_id": str,
+#   "question": str,
+#   "options": [{"text": str, "voter_count": int}],
+#   "correct_option_id": int,
+#   "explanation": str
+# }
+ACTIVE_QUIZZES = {}
+POLL_ID_MAP = {}  # poll_id -> (chat_id, question_index)
+
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    welcome_text = (
+    msg = (
         "👋 **Namaste! Main Quiz Extractor Bot hoon.**\n\n"
-        "Aap mujhe kisi bhi Quiz ka share link bhej sakte hain:\n"
-        "👉 Jaise: `https://t.me/QuizBot?quiz=xxxxx`\n\n"
-        "Main saare Questions, Options, Correct Answer (✅) aur Explanation (Ex:-) "
-        "extract karke aapko `.txt` file bana kar dunga!"
+        "Bina kisi API ID/HASH ke use karne ka tareeqa:\n\n"
+        "1️⃣ Ek private group banayein aur mujhe us group me add karein (Admin permissions dein).\n"
+        "2️⃣ Group me `/record` command bhejein (Recording shuru karne ke liye).\n"
+        "3️⃣ @QuizBot ka quiz us group me 'Start quiz in group' karke chalayein.\n"
+        "4️⃣ Har question ka answer dein taaki right answer aur explanation reveal ho jaye.\n"
+        "5️⃣ Quiz khatam hone par group me `/done` command bhejein.\n\n"
+        "📁 Main turant saare questions ki formatted `.txt` file bhej dunga!"
     )
-    await update.message.reply_text(welcome_text, parse_mode="Markdown")
+    await update.message.reply_text(msg, parse_mode="Markdown")
 
-async def extract_quiz(quiz_param: str, status_msg) -> str:
-    """
-    Userbot session use karke @QuizBot se quiz extract karta hai.
-    """
-    if not API_ID or not API_HASH or not STRING_SESSION:
-        raise ValueError("API_ID, API_HASH ya STRING_SESSION configured nahi hai! Kripya Railway me Environment Variables check karein.")
+async def record_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    ACTIVE_QUIZZES[chat_id] = []
+    await update.message.reply_text(
+        "🔴 **Recording ON ho gayi hai!**\n\n"
+        "Ab aap @QuizBot ka quiz start kijiye. Har question aur answer automatic note ho jayega.\n"
+        "Quiz khatam hone par `/done` bhejein.",
+        parse_mode="Markdown"
+    )
 
-    client = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
-    await client.connect()
-
-    if not await client.is_user_authorized():
-        await client.disconnect()
-        raise ValueError("STRING_SESSION expire ya invalid ho gaya hai! Dubara session generate karein.")
-
-    extracted_data = []
-    
-    try:
-        # QuizBot ko start param bhejte hain
-        quiz_bot = await client.get_entity("QuizBot")
-        
-        await client.send_message(quiz_bot, f"/start {quiz_param}")
-        await asyncio.sleep(2)
-
-        # Message check karte hain aur quiz start karte hain
-        # QuizBot usually sends inline button or instructions
-        # Check last message from QuizBot
-        messages = await client.get_messages(quiz_bot, limit=3)
-        quiz_title = "Quiz"
-        for m in messages:
-            if m.buttons:
-                for row in m.buttons:
-                    for btn in row:
-                        if "I'm ready" in btn.text or "Start" in btn.text or "start" in btn.text.lower():
-                            await btn.click()
-                            break
-
-        await asyncio.sleep(2)
-
-        # Ab questions aana shuru honge loop me
-        q_count = 0
-        last_poll_id = None
-        consecutive_empty = 0
-
-        while True:
-            await asyncio.sleep(1.5)
-            msgs = await client.get_messages(quiz_bot, limit=5)
-            
-            poll_found = False
-            for msg in msgs:
-                if msg.media and isinstance(msg.media, MessageMediaPoll):
-                    poll = msg.media.poll
-                    results = msg.media.results
-                    
-                    if poll.id == last_poll_id:
-                        continue
-
-                    # Naya question mila
-                    poll_found = True
-                    last_poll_id = poll.id
-                    q_count += 1
-                    consecutive_empty = 0
-
-                    # Answer reveal karne ke liye first option vote karte hain
-                    correct_option_index = None
-                    try:
-                        # Vote option 0
-                        await client.send_vote(quiz_bot, msg.id, [b"0"])
-                        await asyncio.sleep(1.2)
-                        
-                        # Updated poll results fetch karte hain
-                        upd_msg = await client.get_messages(quiz_bot, ids=msg.id)
-                        if upd_msg and upd_msg.media and upd_msg.media.results:
-                            res = upd_msg.media.results
-                            if res.results:
-                                for idx, r in enumerate(res.results):
-                                    if getattr(r, 'correct', False):
-                                        correct_option_index = idx
-                                        break
-                    except Exception as e:
-                        logger.warning(f"Voting error: {e}")
-
-                    # Question text
-                    q_text = poll.question
-
-                    # Format Options
-                    options_formatted = []
-                    for idx, opt in enumerate(poll.answers):
-                        letter = OPTION_LETTERS[idx] if idx < len(OPTION_LETTERS) else f"({idx+1})"
-                        opt_text = opt.text
-                        if correct_option_index is not None and idx == correct_option_index:
-                            options_formatted.append(f"{letter}) {opt_text} ✅")
-                        else:
-                            options_formatted.append(f"{letter}) {opt_text}")
-
-                    # Explanation text
-                    explanation_text = ""
-                    if hasattr(msg.media.results, 'solution') and msg.media.results.solution:
-                        explanation_text = msg.media.results.solution
-
-                    # Build Question block
-                    block = f"Q.{q_count}. {q_text}\n"
-                    block += "\n".join(options_formatted)
-                    if explanation_text:
-                        block += f"\nEx:- {explanation_text}"
-                    
-                    extracted_data.append(block)
-
-                    # Update status to user periodically
-                    if q_count % 5 == 0:
-                        try:
-                            await status_msg.edit_text(f"⏳ Extracting questions... ({q_count} questions processed)")
-                        except Exception:
-                            pass
-                    break
-
-            if not poll_found:
-                consecutive_empty += 1
-                # Check agar Quiz complete ho gaya ya result screen aa gayi
-                for msg in msgs:
-                    if msg.text and ("Quiz is finished" in msg.text or "You answered" in msg.text or "Result" in msg.text):
-                        consecutive_empty = 10
-                        break
-
-            if consecutive_empty >= 5:
-                # 7-8 seconds se koi naya question nahi aaya, quiz end maante hain
-                break
-
-    finally:
-        await client.disconnect()
-
-    # Final Text file content
-    separator = "\n\n"
-    final_output = separator.join(extracted_data)
-    return final_output, q_count
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    
-    # Quiz link extract karte hain
-    quiz_param = None
-    if "t.me/QuizBot?quiz=" in text:
-        quiz_param = text.split("quiz=")[-1].split("&")[0].split()[0]
-    elif text.startswith("http"):
-        await update.message.reply_text("❌ Kripya valid QuizBot link bhejein.\nExample: `https://t.me/QuizBot?quiz=xxxxx`", parse_mode="Markdown")
-        return
-    else:
-        await update.message.reply_text("Kripya mujhe QuizBot ka link bhejein, jaise:\n`https://t.me/QuizBot?quiz=mOkjGq1L`", parse_mode="Markdown")
+async def poll_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Jab group me koi Poll/Quiz message aata hai ya update hota hai"""
+    poll = update.poll
+    if not poll:
         return
 
-    status_msg = await update.message.reply_text("🔄 Quiz extraction shuru ho raha hai... Kripya thoda intezaar karein.")
-
-    try:
-        content, count = await extract_quiz(quiz_param, status_msg)
-        
-        if count == 0:
-            await status_msg.edit_text("❌ Quiz se questions extract nahi ho sake. Check karein ki link sahi hai ya nahi.")
+    poll_id = poll.id
+    
+    # Check if this poll belongs to any tracked chat
+    if poll_id in POLL_ID_MAP:
+        chat_id, q_idx = POLL_ID_MAP[poll_id]
+        if chat_id in ACTIVE_QUIZZES and q_idx < len(ACTIVE_QUIZZES[chat_id]):
+            q_data = ACTIVE_QUIZZES[chat_id][q_idx]
+            # Update correct option agar reveal ho gaya
+            if poll.correct_option_id is not None:
+                q_data["correct_option_id"] = poll.correct_option_id
+            if poll.explanation:
+                q_data["explanation"] = poll.explanation
             return
 
-        # Save to temporary txt file
-        file_path = f"quiz_{quiz_param}.txt"
-        with open(file_path, "w", encoding="utf-8") as f:
-            f.write(content)
+async def message_with_poll(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Jab group me naya poll/quiz post hota hai"""
+    chat_id = update.effective_chat.id
+    if chat_id not in ACTIVE_QUIZZES:
+        return
 
-        await status_msg.edit_text(f"✅ Success! Kul {count} questions extract ho gaye hain. File bheji ja rahi hai...")
+    msg = update.effective_message
+    if not msg.poll:
+        return
 
-        # Send file to user
-        with open(file_path, "rb") as f:
-            await update.message.reply_document(
-                document=f,
-                filename=f"quiz_questions.txt",
-                caption=f"📝 **Quiz Extracted Successfully!**\nTotal Questions: {count}"
-            )
+    poll = msg.poll
+    
+    options = []
+    for opt in poll.options:
+        options.append(opt.text)
 
-        if os.path.exists(file_path):
-            os.remove(file_path)
+    q_data = {
+        "poll_id": poll.id,
+        "question": poll.question,
+        "options": options,
+        "correct_option_id": poll.correct_option_id,
+        "explanation": poll.explanation or ""
+    }
 
-    except Exception as e:
-        logger.error(f"Error extracting quiz: {e}", exc_info=True)
-        await status_msg.edit_text(f"⚠️ Error occurred:\n`{str(e)}`", parse_mode="Markdown")
+    q_index = len(ACTIVE_QUIZZES[chat_id])
+    ACTIVE_QUIZZES[chat_id].append(q_data)
+    POLL_ID_MAP[poll.id] = (chat_id, q_index)
+
+async def done_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    if chat_id not in ACTIVE_QUIZZES or len(ACTIVE_QUIZZES[chat_id]) == 0:
+        await update.message.reply_text("⚠️ Abhi tak koi question capture nahi hua! Pehle `/record` karein aur quiz play karein.", parse_mode="Markdown")
+        return
+
+    questions = ACTIVE_QUIZZES[chat_id]
+    total = len(questions)
+
+    # Text format banate hain:
+    formatted_blocks = []
+    for idx, q in enumerate(questions, start=1):
+        lines = []
+        lines.append(f"Q.{idx}. {q['question']}")
+
+        correct_id = q.get("correct_option_id")
+        for o_idx, opt_text in enumerate(q["options"]):
+            letter = OPTION_LETTERS[o_idx] if o_idx < len(OPTION_LETTERS) else f"({o_idx+1})"
+            if correct_id is not None and o_idx == correct_id:
+                lines.append(f"{letter}) {opt_text} ✅")
+            else:
+                lines.append(f"{letter}) {opt_text}")
+
+        explanation = q.get("explanation")
+        if explanation:
+            lines.append(f"Ex:- {explanation}")
+
+        formatted_blocks.append("\n".join(lines))
+
+    final_text = "\n\n".join(formatted_blocks)
+
+    # Memory file stream banate hain
+    file_bytes = io.BytesIO(final_text.encode("utf-8"))
+    file_bytes.name = f"quiz_questions.txt"
+
+    await update.message.reply_document(
+        document=file_bytes,
+        filename=f"quiz_questions.txt",
+        caption=f"✅ **Quiz Successfully Extracted!**\nTotal Questions: {total}"
+    )
+
+    # Reset
+    ACTIVE_QUIZZES[chat_id] = []
 
 def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
+    
     app.add_handler(CommandHandler("start", start_cmd))
-    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
+    app.add_handler(CommandHandler("record", record_cmd))
+    app.add_handler(CommandHandler("done", done_cmd))
+    
+    # Message handlers
+    app.add_handler(MessageHandler(filters.POLL, message_with_poll))
+    app.add_handler(PollAnswerHandler(poll_handler))
 
-    print("🤖 Bot is starting...")
+    print("🤖 Bot is starting (Simple No-API Mode)...")
     app.run_polling()
 
 if __name__ == "__main__":
